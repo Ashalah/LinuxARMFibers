@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="pure-min.css">
+  <link rel="stylesheet" href="grids-responsive-min.css">
+  <link rel="stylesheet" href="side-menu.css">
+  <link rel="stylesheet" href="blackburn.css">
+  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.5.0/css/font-awesome.min.css">
+  <link href="https://fonts.googleapis.com/css?family=Raleway" rel="stylesheet" type="text/css">
+  <link rel="stylesheet" href="vs.css">
+  <script src="highlight.pack.js"></script>
+  <script>hljs.initHighlightingOnLoad();</script>
+</head>
+
+
+<body>
+  <div id="main">
+
+
+<div class="header">
+  <h1>Android fiber switching</h1>
+  <h2></h2>
+</div>
+<div class="content">
+  <div class="post-meta">
+  <div>
+    <i class="fa fa-calendar fa-fw"></i>
+    <time>30 Oct 2016, 21:10 by Andy Robbins</time>
+  </div>
+</div>
+
+  
+
+<p>In order to make the best use of mobile CPUs, which now have up to 8 cores, some time ago I switched my engine to using a fiber-based job system.</p>
+
+<p>I won&rsquo;t go into the details or benefits of this today, but if you want to learn more, definitely watch <a href="http://www.gdcvault.com/play/1022186/Parallelizing-the-Naughty-Dog-Engine">Naughty Dog&rsquo;s GDC presentation</a> on the topic. My system is very much inspired by the one presented by ND, but customized for mobile hardware and my particular needs.</p>
+
+<p>Implementing this job system on Windows was pretty straightforward, since there is a fiber API in Win32 that does everything I need. Unfortunately Android doesn&rsquo;t have this, which means I had to implement fibers myself for Android/Linux.</p>
+
+<p>Since this was quite a bit of work to research all the information needed, I&rsquo;m writing it all down here, both for the benefit of others implementing it, and because I&rsquo;ll forget this myself eventually. Implementing fibers on Android is mostly a matter of having all the information; the actual code is straightforward.</p>
+
+<p>The trouble is Android doesn&rsquo;t implement the <code>makecontext/swapcontext</code> family of functions from Linux. From what I&rsquo;ve read, they had a good reason, but either way this API does not fit fibers well. You should avoid these functions as they involve two system calls (switching into kernel mode) to swap out the signal mask every time you want to switch a fiber, which is very slow.</p>
+
+<p>Let&rsquo;s get started. Keep in mind there are multiple ways to go about this, there&rsquo;s no one correct way to do it. I&rsquo;ve made choices according to what I need, but also to what&rsquo;s easy for me. I wanted to avoid as much assembly code as possible, since I&rsquo;ve never written any before.</p>
+
+<p>Fibers are CPU architecture and OS specific. Here I&rsquo;m documenting only Android, and only ARMv7. I know for sure iOS has at least one crucial difference, but maybe iOS has a fiber API like Windows, I haven&rsquo;t checked. If it doesn&rsquo;t, don&rsquo;t blindly copy my code! I also haven&rsquo;t implemented ARMv8 or x86, which Android also supports, but ARMv8 is just a minor variation in assembly, and the process is the same for x86.</p>
+
+<p>First, a recap: a fiber is just some stack space, and a bit of space to save the CPU registers (the context). There is no thread, in fact the OS doesn&rsquo;t know anything about our fibers. Creating a fiber is basically just an malloc call. A fiber is just state, it cannot be running unless you explicitly swap a thread&rsquo;s context to a fiber&rsquo;s context. The top-most function executing in a fiber cannot return, since there&rsquo;s no return address! Instead, a fiber always switches to another fiber. You can then either delete it or reinitialize it so it can be reused.</p>
+
+<p>There are 4 major problems we need to solve:</p>
+
+<ol>
+<li>Creating and initializing fibers</li>
+<li>Keeping track of which fiber is currently bound to a given thread</li>
+<li>Swapping from one fiber to another</li>
+<li>Switching into a fiber for the first time, from a running thread</li>
+</ol>
+
+<p>There&rsquo;s also the problem of switching from a fiber back to a thread&rsquo;s normal context, but I use worker threads that only exist to host fibers, so I never have to deal with this situation.</p>
+
+<h2 id="part-1-creating-and-initializing-fibers">Part 1: Creating and initializing fibers</h2>
+
+<p>What we need: the amount of stack space to allocate, the function we want the fiber to execute and an argument to pass to that function.</p>
+
+<p>First, we allocate the stack space. This can be an <code>malloc</code> call, but I don&rsquo;t recommend this. Fibers will likely have small stacks (I use 64kb) which can overflow easily, and you want to know when this happens. To catch that, <code>mmap</code> (anonymously) page aligned space for the stack, with an extra page on both ends of the stack. Commit the space for the stack, but leave the two guard pages uncommitted. As soon as your game tries to read or write from these guard memory pages, you&rsquo;ll get a memory access violation, which you can then debug. You don&rsquo;t want to silently overflow your stack, that will be much harder to debug!</p>
+
+<p>The stack pointer (sp register) needs to be 8 bytes aligned at the point of any public interface, according to the AAPCS. That is, every time just before you call a function or return from one.</p>
+
+<p>Next, we allocate space for the fiber&rsquo;s context, ie: the CPU registers we need to save. We could just store these on the stack, but I prefer to store it separately. Either way works.</p>
+
+<p>We need to know which registers to save. For this we need to know the ABI calling convention - we don&rsquo;t actually have to save every single register like when the OS does a context switch! The AAPCS provides most of this information, but unfortunately not all, since it defines a &ldquo;family&rdquo; of ABIs that can be customized. The rest of the information comes directly from Linux, which uses gnueabi on ARM. We also take advantage of the fact we only deal with C/C++ code, which is generally forced to follow a given ABI.</p>
+
+<p>The registers to save are: r4-r14, q4-q7 and the floating point control register. We don&rsquo;t need to save the status registers since they are not preserved across public interface (ie function calls). We don&rsquo;t need to save r0-r3 since they are used for passing arguments into a function and as return values; the other Q (NEON) registers are either used for arguments/return value, or are simply caller saved. r15 is the program counter, which we don&rsquo;t restore, instead we simply branch to our return address. The r registers are 4 bytes wide and should be stored with 4 byte alignment. Q registers are 16 byte wide and should be stored with 16 byte alignment.</p>
+
+<pre><code class="language-C++">struct alignas(16) ARM32_NEON_REGISTER
+{
+    U32 data[4];
+};
+
+// The layout of this struct is referenced by assembly code.
+// 64 byte alignment is to minimize the number of cache lines touched.
+struct alignas(64) ARM32_FIBER_CONTEXT
+{
+    // Context data at the top. To maintain the memory layout for the
+    // assembly code, add all other data members at the bottom.
+    // Memory offset is denoted #n
+
+    ARM32_NEON_REGISTER q4; // #0
+    ARM32_NEON_REGISTER q5; // #16
+    ARM32_NEON_REGISTER q6; // #32
+    ARM32_NEON_REGISTER q7; // #48
+    U32 r4;  // #64
+    U32 r5;  // #68
+    U32 r6;  // #72
+    U32 r7;  // #76
+    U32 r8;  // #80
+    U32 r9;  // #84
+    U32 r10; // #88
+    U32 r11; // #92
+    U32 r12; // #96
+    U32 sp;  // #100, r13
+    U32 lr;  // #104, r14
+    U32 fpscr; // #108, Use VMRS/VMSR instructions.
+
+    // All other data goes here. Assembly code doesn't care after this point.
+
+    FIBER* fiber;
+    void* stack;
+    int stackSize;
+};
+</code></pre>
+
+<p>The reason we can skip all these registers is because our fiber switching functions follow the same calling conventions (ABI) as the rest of the C++ code. In my engine it looks something like this:</p>
+
+<pre><code class="language-C++">void SwitchToFiber(FIBER_CONTEXT* next)
+{
+    AArch32_SwitchToFiber(GetCurrentFiberContext(), next);
+}
+</code></pre>
+
+<p>Where <code>AArch32_SwitchToFiber</code> is implemented in hand written assembly and takes two arguments: a pointer to the context to save the current registers, and a pointer to the context from where to load the registers of the next fiber. Again, there are other ways to do this, but I found this the easiest.</p>
+
+<p>Next, initializing our fiber. You can ignore the stack, it doesn&rsquo;t have to be zeroed out. The registers should all be memset to 0 unless otherwise noted.</p>
+
+<p>The rules for the floating point control register I&rsquo;ve read suggest to me that you shouldn&rsquo;t touch some bits at all, so what I do is copy the contents of this register from the currently running thread at the time the fiber is being created. I use a very simple assembly function that just returns this register, it has the following signature:</p>
+
+<pre><code class="language-C++">extern &quot;C&quot; U32 AArch32_ReadFPSCR();
+</code></pre>
+
+<p><code>U32</code> is just <code>uint32_t</code>, which represents a general purpose register here.</p>
+
+<p>Also keep in mind that stacks grow backwards, so the SP register must point to one byte past the end of our allocated stack memory region. <em>(Explanation: What this means is that the highest memory address of the stack space is used first, then it works its way to lower memory addresses with each function call. This is opposite of how you normally use memory, ex filling an array from the lowest memory address first, with further items added at higher memory addresses.)</em></p>
+
+<p>My code for allocating stack memory with guard pages and setting the SP register properly is in the following redacted snippet:</p>
+
+<pre><code class="language-C++">// Get the system page size
+int pageSize = sysconf(_SC_PAGE_SIZE);
+// Round up stackSize (in bytes) to multiple of pageSize
+int numPages = (stackSize + pageSize - 1) / pageSize;
+
+// Allocate uncommited virtual memory
+U8* guardedStack = (U8*)mmap(nullptr, (numPages + 2) * pageSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+Assert(guardedStack != MAP_FAILED);
+
+// Commit all pages except the first and last one
+int result = mprotect(guardedStack + pageSize, numPages * pageSize, PROT_READ | PROT_WRITE);
+Assert(result == 0);
+
+// Set the stack pointer to one byte past the stack memory range
+// The +1 below is to account for the first guard page (at the lowest memory address)
+ctx-&gt;sp = (U32)(guardedStack + (numPages + 1) * pageSize);
+</code></pre>
+
+<p>Lastly, we need to figure out how will our fiber context &ldquo;know&rdquo; to call the function we want to start the first time we switch to this fiber.</p>
+
+<p>To avoid having a special case in my fiber switching code, I initialize my context so that it jumps to a special bit of assembly that&rsquo;s not a normal function. This code fixes up the registers and calls the function we want the fiber to run.</p>
+
+<p>What I do is I place the function address into the r5 register of the context, and the argument to the function in r4. When a fiber switches, what it really does after swapping registers is to jump (branch, in ARM terminology) to the address in r14, also called LR, the link register. That&rsquo;s how you typically return from a function in ARM. So, when initializing the fiber, I also set r14 to the address of the special code I mentioned above.</p>
+
+<p>When this fiber is first switched to, it will branch to my special initialization code, which copies r4 to r0 (the correct register for the first function argument), clears r14/LR to 0 so there is no return address, and branches to r5. We&rsquo;re now executing the function we wanted this fiber to run. Done!</p>
+
+<h2 id="part-2-keeping-track-of-which-fiber-is-currently-bound-to-a-given-thread">Part 2: Keeping track of which fiber is currently bound to a given thread</h2>
+
+<p>We need to know which fiber we&rsquo;re currently using on a given thread in order to switch to another fiber, because when we save the current registers we need to know which fiber context we&rsquo;re saving to.</p>
+
+<p>This tracking is done automatically so that only the fiber code has to worry about it.</p>
+
+<p>I&rsquo;ve found it easiest to do this in the C++ code using thread_local/TLS.</p>
+
+<pre><code class="language-C++">static thread_local FIBER* tlsCurrentFiber;
+
+FIBER* FiberGetCurrent()
+{
+    return tlsCurrentFiber;
+}
+
+void FiberUpdateCurrent(FIBER* fiber)
+{
+    tlsCurrentFiber = fiber;
+}
+</code></pre>
+
+<p>The only trick to this is to put these functions by themselves in a separate .cpp file to avoid TLS caching issues in compilers other than Microsoft&rsquo;s.</p>
+
+<p>Putting all the code together, the function that switches fibers is just 3 lines of code:</p>
+
+<pre><code class="language-C++">// We put the ARM implementation here because of compiler TLS caching issues.
+// Any function calling FiberGetCurrent()/FiberUpdateCurrent() must NOT be defined
+// in the same source file those two functions are defined in.
+#if BUILD_OS == BUILD_OS_ANDROID
+extern &quot;C&quot; void AArch32_SwitchToFiber(void* currentHandle, void* nextHandle);
+
+void FiberSwitch(FIBER_HANDLE nextHandle)
+{
+    FIBER* self = FiberGetCurrent();
+    AArch32_SwitchToFiber(self-&gt;handle.handle, nextHandle.handle);
+    FiberUpdateCurrent(self);
+}
+#endif
+</code></pre>
+
+<p>Note: <code>AArch32_SwitchToFiber()</code> does not return until execution has switched back to the context of the fiber executing the above function, so a lot of time can pass between <code>AArch32_SwitchToFiber</code> and <code>FiberUpdateCurrent</code>.</p>
+
+<p>You should notice that the first line is reading the current fiber context pointer, this means it must be initialized somewhere else! And it is, in the FiberMain() function. This is the first function (the startup function) called in all my fibers:</p>
+
+<pre><code class="language-C++">static void FiberMain(void* p)
+{
+    FIBER* fiber = (FIBER*)p;
+    FiberUpdateCurrent(fiber);
+    // the rest of the function here
+}
+</code></pre>
+
+<p>This basically means the &ldquo;user code&rdquo; is responsible, which if fine for me. If you were creating a public fiber library, you&rsquo;d want to initialize this pointer using the startup assembly code, for example by passing in <code>&amp;tlsCurrentFiber</code> (the address of tlsCurrentFiber) using one of the registers in the context.</p>
+
+<h2 id="part-3-swapping-from-one-fiber-to-another">Part 3: Swapping from one fiber to another</h2>
+
+<p>This has mostly already been covered. Switching is done by <code>FiberSwitch()</code>, which calls the following function:</p>
+
+<pre><code class="language-C++">extern &quot;C&quot; void AArch32_SwitchToFiber(void* currentHandle, void* nextHandle);
+</code></pre>
+
+<p>This function actually takes <code>ARM32_FIBER_CONTEXT*</code> as parameters (defined above), and is implemented in assembly. ARMv7 code follows:</p>
+
+<pre><code class="language-asm">    .globl  AArch32_SwitchToFiber
+    .align  2
+    .type   AArch32_SwitchToFiber,%function
+    // r0 = current fiber context
+    // r1 = next fiber context
+    // use r2/r3 for scratch
+AArch32_SwitchToFiber:
+    // Store the current fiber context
+    add r2, r0, #64
+    stmia r2, {r4-r12,sp,lr}
+    vstmia r0, {q4-q7}
+    vmrs r3, fpscr
+    str r3, [r0, #108]
+    // Load the next fiber context
+    add r2, r1, #64
+    ldmia r2, {r4-r12,sp,lr}
+    vldmia r1, {q4-q7}
+    ldr r3, [r1, #108]
+    vmsr fpscr, r3
+    bx lr
+</code></pre>
+
+<p>Pretty simple, only 11 instructions. No messy kernel calls required, and we&rsquo;re only saving/restoring the fewest registers possible, unlike a full context switch the OS does whenever it switches a thread or program.</p>
+
+<h2 id="part-4-switching-into-a-fiber-for-the-first-time-from-a-running-thread">Part 4: Switching into a fiber for the first time, from a running thread</h2>
+
+<p>Already mostly covered. When initializing a fiber, LR (the register we return to in the assembly code above for <code>AArch32_SwitchToFiber</code>) is set to the address of a special assembly function called <code>AArch32_FiberEntryPoint</code>. ARMv7 code:</p>
+
+<pre><code class="language-asm">    .globl  AArch32_FiberEntryPoint
+    .align  2
+    .type   AArch32_FiberEntryPoint,%function
+AArch32_FiberEntryPoint:
+    mov r0, r4
+    mov r1, r5
+    mov r4, #0
+    mov r5, #0
+    mov lr, #0
+    bx r1
+</code></pre>
+
+<p>The explanation is at the end of Part 1.</p>
+
+<p>And that&rsquo;s basically it. Not complicated, but took a considerable amount of time to do, for two main reasons:</p>
+
+<ol>
+<li>the information needed is quite a bit scattered, and</li>
+<li>triple-checking everything and testing is a huge time sink.</li>
+</ol>
+
+<p>But it&rsquo;s better to spend the time checking and testing this kind of code than dealing with unexplained bugs months down the line that cannot be debugged without stepping through assembly. So much code depends on this service that it would be irresponsible not to thoroughly check everything.</p>
+
+<p>I hope this is useful information. For questions or feedback, contact me. I&rsquo;m also available for consulting.</p>
+
+<h2 id="references-and-helpful-links">References and helpful links:</h2>
+
+<p><a href="http://www.gdcvault.com/play/1022186/Parallelizing-the-Naughty-Dog-Engine">http://www.gdcvault.com/play/1022186/Parallelizing-the-Naughty-Dog-Engine</a></p>
+
+<p><a href="http://infocenter.arm.com/help/topic/com.arm.doc.ihi0042f/IHI0042F_aapcs.pdf">http://infocenter.arm.com/help/topic/com.arm.doc.ihi0042f/IHI0042F_aapcs.pdf</a></p>
+
+<p><a href="http://www.crystalclearsoftware.com/soc/coroutine/coroutine/fibers.html">http://www.crystalclearsoftware.com/soc/coroutine/coroutine/fibers.html</a></p>
+
+<p><a href="https://community.arm.com/groups/android-community/blog/2015/03/27/arm-neon-programming-quick-reference">https://community.arm.com/groups/android-community/blog/2015/03/27/arm-neon-programming-quick-reference</a></p>
+
+<p><a href="https://code.google.com/p/android/issues/detail?id=34784">https://code.google.com/p/android/issues/detail?id=34784</a></p>
+
+<p><a href="http://maisonikkoku.com/jaystation2/chapter_08.html">http://maisonikkoku.com/jaystation2/chapter_08.html</a></p>
+
+<p>There are other references I&rsquo;ve used, some quite important, that unfortunately I can no longer recall.</p>
+
+<h2 id="changelog">Changelog</h2>
+
+<p>31/10/2016 - Added notes on stacks growing backwards in memory, and example code for allocating guard pages and calculating the initial stack pointer correctly</p>
+
+</div>
+
+</div>
+</div>
+</html>
+
